@@ -67,3 +67,31 @@ https://votre-service.up.railway.app/mcp
 
 **Phase 1** (chargement de l'univers complet via `lake/panel`, paginé par lots de 100
 symboles) ne démarre qu'une fois 0A-0D validés sans anomalie.
+
+## Phase 1 — bulk loader (ajouté)
+
+- **engo_lake_panel_load**({ symbols, start, end, fields?, dataset?, cache_key? }) —
+  charge l'historique de prix pour une liste de tickers (n'importe quelle taille,
+  découpée automatiquement en lots de 100 — la limite de l'API). La matrice complète est
+  **mise en cache côté serveur** (variable en mémoire du process Node, `Map` au niveau
+  module — donc partagée entre appels tant que le process Railway tourne, perdue à chaque
+  redéploiement/redémarrage). La réponse renvoyée au chat ne contient **jamais** les prix
+  bruts — seulement : clé de cache, nombre de symboles chargés/manquants, couverture de
+  dates, et les "receipts" de chaque lot (provenance/hash côté Engo).
+- **engo_cache_inspect**({ cache_key? }) — liste les caches en mémoire, ou inspecte un
+  cache précis (nombre de lignes par symbole, première/dernière date) sans refaire
+  d'appel à Engo.
+
+⚠️ **Schéma de réponse `lake/panel` non vérifié indépendamment** — la doc Engo ne précise
+pas la forme exacte du JSON retourné. Le code essaie plusieurs noms de champs probables
+(`data`/`panel`/`series`). **Premier test recommandé : un petit lot (5-10 symboles, quelques
+mois)**, puis `engo_cache_inspect` pour vérifier que `symbols_cached` n'est pas resté à 0.
+Si c'est le cas malgré un receipt `status: "ok"`, partagez un chunk de réponse brute et
+j'ajuste le mapping de champs.
+
+### Pas encore fait (volontairement, hors scope de ce test)
+- `lake/panel.parquet` (le format binaire) — priorité donnée à la version JSON exploitable
+  directement par le serveur.
+- Tout calcul de percentile/MOM/portefeuille — c'est la prochaine étape, une fois le bulk
+  loader validé sur un échantillon réel.
+  

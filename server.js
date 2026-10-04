@@ -59,6 +59,55 @@ function errorResult(err) {
   return { isError: true, content: [{ type: "text", text: `Error: ${err.message || String(err)}` }] };
 }
 
+async function engoPost(path, body) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 30000);
+  let response;
+  try {
+    response = await fetch(`${ENGO_BASE_URL}${path}`, {
+      method: "POST",
+      signal: controller.signal,
+      headers: {
+        Authorization: `Bearer ${ENGO_API_KEY}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(body),
+    });
+  } catch (err) {
+    throw new Error(`Network error calling Engo (POST ${path}): ${err.message}`);
+  } finally {
+    clearTimeout(timeout);
+  }
+  const text = await response.text();
+  let data;
+  try {
+    data = JSON.parse(text);
+  } catch {
+    throw new Error(`Engo returned non-JSON (status ${response.status}) for POST ${path}: ${text.slice(0, 400)}`);
+  }
+  if (!response.ok) {
+    throw new Error(`Engo error (status ${response.status}) for POST ${path}: ${JSON.stringify(data)}`);
+  }
+  return data;
+}
+
+function chunkArray(arr, size) {
+  const out = [];
+  for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size));
+  return out;
+}
+
+/**
+ * Module-scope (not per-request) cache: survives across separate tool calls
+ * within the same running Railway process, lost on redeploy/restart.
+ * Key -> { symbols, start, end, fields, dataset, data: { symbol: rows[] }, cached_at }
+ */
+const panelCache = new Map();
+
+function makeCacheKey(prefix) {
+  return `${prefix}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 7)}`;
+}
+
 async function withConcurrency(items, limit, worker) {
   const results = new Array(items.length);
   let next = 0;
@@ -237,6 +286,120 @@ function buildServer() {
     }
   );
 
+  server.tool(
+    "engo_lake_panel_load",
+    "Phase 1 bulk loader: fetches adjusted daily price history for MANY symbols from Engo's lake/panel endpoint in one logical call. Automatically chunks the symbol list into batches of <=100 (the API's per-call cap) and fetches each sequentially, merging the result. The full matrix is CACHED SERVER-SIDE under a cache_key and NEVER returned in the response — only a compact summary (symbols loaded/missing, date coverage, row counts, chunk receipts). Use engo_cache_inspect to sanity-check what's cached, and future compute tools will reference the matrix by cache_key without re-fetching or re-transmitting it.",
+    {
+      symbols: z.array(z.string()).min(1).describe("Ticker list, any length — chunked into batches of 100 automatically."),
+      start: z.string().describe("Start date, YYYY-MM-DD"),
+      end: z.string().describe("End date, YYYY-MM-DD"),
+      fields: z.array(z.string()).optional().describe("Fields to fetch, default [\"close\"]"),
+      dataset: z.string().optional().describe("us_eod (default, survivorship-free archive) or us_eod_native"),
+      cache_key: z.string().optional().describe("Reuse/overwrite a specific cache key instead of auto-generating one."),
+    },
+    async ({ symbols, start, end, fields, dataset, cache_key }) => {
+      try {
+        const batches = chunkArray(symbols, 100);
+        const merged = {};
+        const receipts = [];
+        const missing = [];
+
+        for (const batch of batches) {
+          const body = { symbols: batch, start, end, fields: fields ?? ["close"], allow_partial: true };
+          if (dataset) body.dataset = dataset;
+          let resp;
+          try {
+            resp = await engoPost("/api/v1/lake/panel", body);
+          } catch (err) {
+            receipts.push({ batch_size: batch.length, status: "error", error: err.message });
+            missing.push(...batch);
+            continue;
+          }
+          // Schema not independently verified yet — defensive fallbacks across likely shapes.
+          const panelData = resp.data ?? resp.panel ?? resp.series ?? {};
+          for (const sym of batch) {
+            const rows = panelData[sym] ?? panelData?.symbols?.[sym];
+            if (rows && rows.length) merged[sym] = rows;
+            else missing.push(sym);
+          }
+          receipts.push({
+            batch_size: batch.length,
+            status: "ok",
+            dataset: resp.dataset ?? dataset ?? "us_eod",
+            missing_in_batch: resp.receipt?.missing_symbols ?? [],
+            row_count: resp.receipt?.row_count ?? null,
+            manifest_hash: resp.receipt?.manifest_hash ?? null,
+            complete: resp.receipt?.complete ?? null,
+          });
+        }
+
+        const key = cache_key || makeCacheKey("panel");
+        panelCache.set(key, {
+          symbols,
+          start,
+          end,
+          fields: fields ?? ["close"],
+          dataset: dataset ?? "us_eod",
+          data: merged,
+          cached_at: new Date().toISOString(),
+        });
+
+        return textResult({
+          cache_key: key,
+          symbols_requested: symbols.length,
+          symbols_cached: Object.keys(merged).length,
+          symbols_missing: [...new Set(missing)],
+          date_range: { start, end },
+          chunks_fetched: batches.length,
+          receipts,
+          note: "Full price matrix cached server-side under cache_key — not included in this response. In-memory cache: lost on server redeploy/restart.",
+          schema_warning: "lake/panel response shape not yet independently verified — if symbols_cached is 0 despite an 'ok' receipt status, the field-name fallbacks (data/panel/series) likely need adjusting. Share one raw chunk receipt and I'll fix it.",
+        });
+      } catch (err) {
+        return errorResult(err);
+      }
+    }
+  );
+
+  server.tool(
+    "engo_cache_inspect",
+    "Lists what's currently cached server-side from engo_lake_panel_load calls (symbols, date range, row counts per symbol), or inspects one cache_key in detail. Does not re-fetch from Engo. Use this to sanity-check the bulk loader before building anything on top of it.",
+    {
+      cache_key: z.string().optional().describe("Inspect one specific cache entry; omit to list all cached entries."),
+    },
+    async ({ cache_key }) => {
+      if (cache_key) {
+        const entry = panelCache.get(cache_key);
+        if (!entry) return textResult({ error: "cache_key not found", available_keys: [...panelCache.keys()] });
+        const perSymbol = Object.entries(entry.data).map(([sym, rows]) => ({
+          symbol: sym,
+          row_count: rows.length,
+          first: rows[0] ?? null,
+          last: rows[rows.length - 1] ?? null,
+        }));
+        return textResult({
+          cache_key,
+          start: entry.start,
+          end: entry.end,
+          dataset: entry.dataset,
+          cached_at: entry.cached_at,
+          symbol_count: Object.keys(entry.data).length,
+          per_symbol_sample: perSymbol.slice(0, 10),
+          truncated: perSymbol.length > 10,
+        });
+      }
+      return textResult({
+        cached_entries: [...panelCache.entries()].map(([key, entry]) => ({
+          cache_key: key,
+          symbol_count: Object.keys(entry.data).length,
+          start: entry.start,
+          end: entry.end,
+          cached_at: entry.cached_at,
+        })),
+      });
+    }
+  );
+
   return server;
 }
 
@@ -269,4 +432,3 @@ app.get("/mcp", (_req, res) => {
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`mcp-az-recon listening on port ${PORT}`));
-        

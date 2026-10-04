@@ -310,6 +310,7 @@ function buildServer() {
           let resp;
           try {
             resp = await engoPost("/api/v1/lake/panel", body);
+            console.log("ENGO RAW RESPONSE:", JSON.stringify(resp));
           } catch (err) {
             receipts.push({ batch_size: batch.length, status: "error", error: err.message });
             missing.push(...batch);

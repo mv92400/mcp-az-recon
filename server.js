@@ -946,12 +946,765 @@ function buildServer() {
 
           const bySymbol = {};
 
-          for (const row of panelRows) {
-            const sym =
-              row.symbol;
+                 for (const row of panelRows) {
+            const sym = row.symbol;
 
             if (!sym) continue;
 
-            (
-              bySymbol[sym] ??
+            (bySymbol[sym] ?? (bySymbol[sym] = [])).push({
+              date: row.date,
+              close: row.close,
+            });
+          }
+
+          for (const sym of batch) {
+            const rows = bySymbol[sym];
+
+            if (rows && rows.length) {
+              merged[sym] = rows.sort((a, b) =>
+                a.date.localeCompare(b.date)
+              );
+            } else {
+              missing.push(sym);
+            }
+          }
+
+          receipts.push({
+            batch_size: batch.length,
+            status: "ok",
+
+            dataset:
+              resp.dataset ??
+              dataset ??
+              "us_eod",
+
+            missing_in_batch:
+              resp.receipt?.missing_symbols ??
+              [],
+
+            row_count:
+              resp.receipt?.rows ??
+              resp.n ??
+              null,
+
+            manifest_hash:
+              resp.receipt?.manifest_sha256 ??
+              null,
+
+            complete:
+              resp.receipt?.complete ??
+              null,
+          });
+        }
+
+        const key =
+          cache_key ||
+          makeCacheKey("panel");
+
+        panelCache.set(key, {
+          symbols,
+          start,
+          end,
+
+          fields:
+            fields ?? ["close"],
+
+          dataset:
+            dataset ?? "us_eod",
+
+          data: merged,
+
+          cached_at:
+            new Date().toISOString(),
+        });
+
+        return textResult({
+          cache_key: key,
+
+          symbols_requested:
+            symbols.length,
+
+          symbols_cached:
+            Object.keys(merged).length,
+
+          symbols_missing: [
+            ...new Set(missing),
+          ],
+
+          date_range: {
+            start,
+            end,
+          },
+
+          chunks_fetched:
+            batches.length,
+
+          receipts,
+
+          note:
+            "Full price matrix cached server-side. Cache is lost on redeploy/restart.",
+        });
+      } catch (err) {
+        return errorResult(err);
+      }
+    }
+  );
+
+  /* ========================================================
+     PHASE 2 — ALPHA ZEN RECONSTRUCTION
+     ======================================================== */
+
+  server.tool(
+    "engo_alpha_compute",
+    "Alpha Zen reconstruction engine: daily data -> monthly closes -> M1/M3/M6/M12 -> cross-sectional percentiles -> weighted Alpha Zen score.",
+    {
+      cache_key: z.string(),
+
+      asof: z.string(),
+
+      top_n: z
+        .number()
+        .int()
+        .min(1)
+        .max(500)
+        .optional(),
+
+      m1_weight: z
+        .number()
+        .min(0)
+        .max(1)
+        .optional(),
+
+      m3_weight: z
+        .number()
+        .min(0)
+        .max(1)
+        .optional(),
+
+      m6_weight: z
+        .number()
+        .min(0)
+        .max(1)
+        .optional(),
+
+      m12_weight: z
+        .number()
+        .min(0)
+        .max(1)
+        .optional(),
+    },
+
+    async ({
+      cache_key,
+      asof,
+      top_n = 50,
+      m1_weight = 0.10,
+      m3_weight = 0.30,
+      m6_weight = 0.30,
+      m12_weight = 0.30,
+    }) => {
+      try {
+        const entry = panelCache.get(cache_key);
+
+        if (!entry) {
+          return textResult({
+            status: "error",
+            error: "cache_key not found",
+            cache_key,
+            available_keys: [
+              ...panelCache.keys(),
+            ],
+          });
+        }
+
+        const weightSum =
+          m1_weight +
+          m3_weight +
+          m6_weight +
+          m12_weight;
+
+        if (Math.abs(weightSum - 1) > 0.000001) {
+          return textResult({
+            status: "error",
+            error:
+              "Momentum weights must sum to exactly 1.0",
+            weights: {
+              m1: m1_weight,
+              m3: m3_weight,
+              m6: m6_weight,
+              m12: m12_weight,
+            },
+            weight_sum: weightSum,
+          });
+        }
+
+        const weights = {
+          m1: m1_weight,
+          m3: m3_weight,
+          m6: m6_weight,
+          m12: m12_weight,
+        };
+
+        /*
+         * M12 protection.
+         *
+         * Example:
+         * asof = 2018-12-31
+         * reference month = 2017-12
+         * required history = 2017-12-01
+         */
+        const m12TargetDate =
+          subtractMonths(asof, 12);
+
+        const requiredStart =
+          `${m12TargetDate.slice(0, 7)}-01`;
+
+        if (entry.start > requiredStart) {
+          return textResult({
+            status:
+              "insufficient_history",
+
+            cache_key,
+            asof,
+
+            required_history_start:
+              requiredStart,
+
+            cache_start:
+              entry.start,
+
+            cache_end:
+              entry.end,
+
+            message:
+              "Cached panel starts too late to calculate a valid M12. Reload the same PIT universe with sufficient history.",
+          });
+        }
+
+        if (entry.end < asof) {
+          return textResult({
+            status:
+              "insufficient_history",
+
+            cache_key,
+            asof,
+
+            cache_start:
+              entry.start,
+
+            cache_end:
+              entry.end,
+
+            message:
+              "Cached panel ends before asof. No look-ahead or extrapolation is performed.",
+          });
+        }
+
+        const universe =
+          Object.keys(entry.data);
+
+        const rows = [];
+
+        let noAsOf = 0;
+        let noM1 = 0;
+        let noM3 = 0;
+        let noM6 = 0;
+        let noM12 = 0;
+
+        for (const symbol of universe) {
+          const dailyRows =
+            entry.data[symbol];
+
+          const monthlyRows =
+            buildMonthlyCloses(dailyRows);
+
+          const asofMonthClose =
+            monthlyCloseOnOrBefore(
+              monthlyRows,
+              asof
+            );
+
+          const baseM1 =
+            previousMonthlyClose(
+              monthlyRows,
+              asof,
+              1
+            );
+
+          const baseM3 =
+            previousMonthlyClose(
+              monthlyRows,
+              asof,
+              3
+            );
+
+          const baseM6 =
+            previousMonthlyClose(
+              monthlyRows,
+              asof,
+              6
+            );
+
+          const baseM12 =
+            previousMonthlyClose(
+              monthlyRows,
+              asof,
+              12
+            );
+
+          if (!asofMonthClose) {
+            noAsOf++;
+            continue;
+          }
+
+          const row = {
+            symbol,
+
+            asof_month:
+              asofMonthClose.month,
+
+            asof_date_used:
+              asofMonthClose.date_used,
+
+            close_asof:
+              asofMonthClose.close,
+
+            m1_base_date_used:
+              baseM1?.date_used ?? null,
+
+            m3_base_date_used:
+              baseM3?.date_used ?? null,
+
+            m6_base_date_used:
+              baseM6?.date_used ?? null,
+
+            m12_base_date_used:
+              baseM12?.date_used ?? null,
+
+            m1_pct: null,
+            m3_pct: null,
+            m6_pct: null,
+            m12_pct: null,
+
+            data_status: "ok",
+          };
+
+          if (baseM1 && baseM1.close > 0) {
+            row.m1_pct =
+              ((asofMonthClose.close -
+                baseM1.close) /
+                baseM1.close) *
+              100;
+          } else {
+            noM1++;
+          }
+
+          if (baseM3 && baseM3.close > 0) {
+            row.m3_pct =
+              ((asofMonthClose.close -
+                baseM3.close) /
+                baseM3.close) *
+              100;
+          } else {
+            noM3++;
+          }
+
+          if (baseM6 && baseM6.close > 0) {
+            row.m6_pct =
+              ((asofMonthClose.close -
+                baseM6.close) /
+                baseM6.close) *
+              100;
+          } else {
+            noM6++;
+          }
+
+          if (baseM12 && baseM12.close > 0) {
+            row.m12_pct =
+              ((asofMonthClose.close -
+                baseM12.close) /
+                baseM12.close) *
+              100;
+          } else {
+            noM12++;
+          }
+
+          for (const key of [
+            "m1_pct",
+            "m3_pct",
+            "m6_pct",
+            "m12_pct",
+          ]) {
+            if (Number.isFinite(row[key])) {
+              row[key] =
+                Number(row[key].toFixed(6));
+            }
+          }
+
+          rows.push(row);
+        }
+
+        addPercentiles(rows, "m1_pct");
+        addPercentiles(rows, "m3_pct");
+        addPercentiles(rows, "m6_pct");
+        addPercentiles(rows, "m12_pct");
+
+        let completeCount = 0;
+
+        for (const row of rows) {
+          row.alpha_zen_score =
+            computeAlphaZenScore(
+              row,
+              weights
+            );
+
+          if (
+            row.alpha_zen_score !== null
+          ) {
+            completeCount++;
+          }
+        }
+
+        const eligible =
+          rows
+            .filter(
+              (r) =>
+                r.alpha_zen_score !== null
+            )
+            .sort((a, b) => {
+              if (
+                b.alpha_zen_score !==
+                a.alpha_zen_score
+              ) {
+                return (
+                  b.alpha_zen_score -
+                  a.alpha_zen_score
+                );
+              }
+
+              if (b.m6_pct !== a.m6_pct) {
+                return b.m6_pct - a.m6_pct;
+              }
+
+              if (b.m12_pct !== a.m12_pct) {
+                return b.m12_pct - a.m12_pct;
+              }
+
+              return a.symbol.localeCompare(
+                b.symbol
+              );
+            });
+
+        const ranked =
+          eligible.map(
+            (row, index) => ({
+              rank: index + 1,
+              ...row,
+            })
+          );
+
+        return textResult({
+          status: "ok",
+
+          engine:
+            "alpha_zen_reconstruction",
+
+          methodology: {
+            monthly_close_method:
+              "Last available trading observation in each calendar month",
+
+            lookahead_policy:
+              "Only observations dated on or before asof are used",
+
+            m1_weight:
+              weights.m1,
+
+            m3_weight:
+              weights.m3,
+
+            m6_weight:
+              weights.m6,
+
+            m12_weight:
+              weights.m12,
+
+            score_method:
+              "Weighted cross-sectional percentiles of M1/M3/M6/M12",
+
+            raw_return_formula:
+              "(month_end_close_asof - month_end_close_base) / month_end_close_base",
+          },
+
+          cache: {
+            cache_key,
+
+            cache_start:
+              entry.start,
+
+            cache_end:
+              entry.end,
+
+            dataset:
+              entry.dataset,
+
+            universe_size:
+              universe.length,
+          },
+
+          asof,
+
+          required_history_start:
+            requiredStart,
+
+          universe_diagnostics: {
+            symbols_in_cache:
+              universe.length,
+
+            symbols_with_asof:
+              rows.length,
+
+            symbols_missing_asof:
+              noAsOf,
+
+            complete_momentum:
+              completeCount,
+
+            incomplete_momentum:
+              rows.length -
+              completeCount,
+
+            missing_m1:
+              noM1,
+
+            missing_m3:
+              noM3,
+
+            missing_m6:
+              noM6,
+
+            missing_m12:
+              noM12,
+          },
+
+          result_count:
+            Math.min(
+              top_n,
+              ranked.length
+            ),
+
+          eligible_count:
+            ranked.length,
+
+          results:
+            ranked.slice(
+              0,
+              top_n
+            ),
+        });
+      } catch (err) {
+        return errorResult(err);
+      }
+    }
+  );
+
+  /* ========================================================
+     CACHE INSPECTION
+     ======================================================== */
+
+  server.tool(
+    "engo_cache_inspect",
+    "Lists or inspects server-side panel caches without re-fetching Engo data.",
+    {
+      cache_key: z
+        .string()
+        .optional(),
+    },
+
+    async ({ cache_key }) => {
+      if (cache_key) {
+        const entry =
+          panelCache.get(cache_key);
+
+        if (!entry) {
+          return textResult({
+            error:
+              "cache_key not found",
+
+            available_keys:
+              [...panelCache.keys()],
+          });
+        }
+
+        const perSymbol =
+          Object.entries(entry.data).map(
+            ([sym, rows]) => ({
+              symbol: sym,
+
+              row_count:
+                rows.length,
+
+              first:
+                rows[0] ?? null,
+
+              last:
+                rows[rows.length - 1] ??
+                null,
+            })
+          );
+
+        return textResult({
+          cache_key,
+
+          start:
+            entry.start,
+
+          end:
+            entry.end,
+
+          dataset:
+            entry.dataset,
+
+          cached_at:
+            entry.cached_at,
+
+          symbol_count:
+            Object.keys(entry.data).length,
+
+          per_symbol_sample:
+            perSymbol.slice(0, 10),
+
+          truncated:
+            perSymbol.length > 10,
+        });
+      }
+
+      return textResult({
+        cached_entries:
+          [...panelCache.entries()].map(
+            ([key, entry]) => ({
+              cache_key: key,
+
+              symbol_count:
+                Object.keys(
+                  entry.data
+                ).length,
+
+              start:
+                entry.start,
+
+              end:
+                entry.end,
+
+              cached_at:
+                entry.cached_at,
+            })
+          ),
+      });
+    }
+  );
+
+  return server;
+}
+
+/* ==========================================================
+   EXPRESS / MCP HTTP SERVER
+   ========================================================== */
+
+const app = express();
+
+app.use(express.json());
+
+app.get("/", (_req, res) =>
+  res.json({
+    status: "ok",
+
+    service:
+      "mcp-az-recon",
+
+    phase: "2",
+
+    build:
+      "alpha-zen-reconstruction-engine-2026-10-05",
+  })
+);
+
+app.post(
+  "/mcp",
+  async (req, res) => {
+    try {
+      const server =
+        buildServer();
+
+      const transport =
+        new StreamableHTTPServerTransport({
+          sessionIdGenerator:
+            undefined,
+        });
+
+      res.on("close", () => {
+        transport.close();
+        server.close();
+      });
+
+      await server.connect(
+        transport
+      );
+
+      await transport.handleRequest(
+        req,
+        res,
+        req.body
+      );
+    } catch (err) {
+      console.error(
+        "Error handling MCP request:",
+        err
+      );
+
+      if (!res.headersSent) {
+        res.status(500).json({
+          jsonrpc: "2.0",
+
+          error: {
+            code: -32603,
+
+            message:
+              "Internal server error",
+          },
+
+          id: null,
+        });
+      }
+    }
+  }
+);
+
+app.get(
+  "/mcp",
+  (_req, res) => {
+    res.status(405).json({
+      jsonrpc: "2.0",
+
+      error: {
+        code: -32000,
+
+        message:
+          "Method not allowed. Use POST.",
+      },
+
+      id: null,
+    });
+  }
+);
+
+const PORT =
+  process.env.PORT || 3000;
+
+app.listen(
+  PORT,
+  () =>
+    console.log(
+      `mcp-az-recon listening on port ${PORT}`
+    )
+);
          

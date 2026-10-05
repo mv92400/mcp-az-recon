@@ -173,6 +173,7 @@ function buildServer() {
           strict,
           raw_status: data.status ?? null,
           member_count: tickers.length,
+          members: tickers,
           sample_members: tickers.slice(0, 15),
           canary_check: {
             checked: CANARY_TICKERS,

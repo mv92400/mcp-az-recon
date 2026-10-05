@@ -288,7 +288,7 @@ function buildServer() {
 
   server.tool(
     "engo_lake_panel_load",
-    "Phase 1 bulk loader: fetches adjusted daily price history for MANY symbols from Engo's lake/panel endpoint in one logical call. Automatically chunks the symbol list into batches of <=100 (the API's per-call cap) and fetches each sequentially, merging the result. The full matrix is CACHED SERVER-SIDE under a cache_key and NEVER returned in the response — only a compact summary (symbols loaded/missing, date coverage, row counts, chunk receipts). Use engo_cache_inspect to sanity-check what's cached, and future compute tools will reference the matrix by cache_key without re-fetching or re-transmitting it.",
+    "Phase 1 bulk loader: fetches adjusted daily price history for MANY symbols from Engo's lake/panel endpoint in one logical call. Automatically chunks the symbol list into batches of <=100 (the API's per-call cap) and fetches each sequentially, merging the result. The full matrix is CACHED SERVER-SIDE under a cache_key and NEVER returned in the response — only a compact summary (symbols loaded/missing, date coverage, row counts, chunk receipts). Use engo_cache_inspect to sanity-check what's cached, and future compute tools will reference the matrix by cache_key without re-fetching or re-transmitting it. (Response schema confirmed 2026-10-04: resp.panel is a flat array of {symbol,date,close} rows.)",
     {
       symbols: z.array(z.string()).min(1).describe("Ticker list, any length — chunked into batches of 100 automatically."),
       start: z.string().describe("Start date, YYYY-MM-DD"),
@@ -310,16 +310,22 @@ function buildServer() {
           let resp;
           try {
             resp = await engoPost("/api/v1/lake/panel", body);
-            console.log("ENGO RAW RESPONSE:", JSON.stringify(resp));
           } catch (err) {
             receipts.push({ batch_size: batch.length, status: "error", error: err.message });
             missing.push(...batch);
             continue;
           }
-          // Schema not independently verified yet — defensive fallbacks across likely shapes.
-          const panelData = resp.data ?? resp.panel ?? resp.series ?? {};
+          // Confirmed schema (2026-10-04): resp.panel is a FLAT array of
+          // { symbol, date, close, ... } rows — not grouped by symbol.
+          const panelRows = resp.panel ?? resp.data ?? resp.series ?? [];
+          const bySymbol = {};
+          for (const row of panelRows) {
+            const sym = row.symbol;
+            if (!sym) continue;
+            (bySymbol[sym] ??= []).push({ date: row.date, close: row.close });
+          }
           for (const sym of batch) {
-            const rows = panelData[sym] ?? panelData?.symbols?.[sym];
+            const rows = bySymbol[sym];
             if (rows && rows.length) merged[sym] = rows;
             else missing.push(sym);
           }
@@ -328,8 +334,8 @@ function buildServer() {
             status: "ok",
             dataset: resp.dataset ?? dataset ?? "us_eod",
             missing_in_batch: resp.receipt?.missing_symbols ?? [],
-            row_count: resp.receipt?.row_count ?? null,
-            manifest_hash: resp.receipt?.manifest_hash ?? null,
+            row_count: resp.receipt?.rows ?? resp.n ?? null,
+            manifest_hash: resp.receipt?.manifest_sha256 ?? null,
             complete: resp.receipt?.complete ?? null,
           });
         }
@@ -354,7 +360,6 @@ function buildServer() {
           chunks_fetched: batches.length,
           receipts,
           note: "Full price matrix cached server-side under cache_key — not included in this response. In-memory cache: lost on server redeploy/restart.",
-          schema_warning: "lake/panel response shape not yet independently verified — if symbols_cached is 0 despite an 'ok' receipt status, the field-name fallbacks (data/panel/series) likely need adjusting. Share one raw chunk receipt and I'll fix it.",
         });
       } catch (err) {
         return errorResult(err);
@@ -407,7 +412,9 @@ function buildServer() {
 const app = express();
 app.use(express.json());
 
-app.get("/", (_req, res) => res.json({ status: "ok", service: "mcp-az-recon", phase: "0" }));
+app.get("/", (_req, res) =>
+  res.json({ status: "ok", service: "mcp-az-recon", phase: "1", build: "panel-schema-fix-2026-10-04" })
+);
 
 app.post("/mcp", async (req, res) => {
   try {
@@ -433,3 +440,4 @@ app.get("/mcp", (_req, res) => {
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`mcp-az-recon listening on port ${PORT}`));
+          
